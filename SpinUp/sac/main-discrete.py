@@ -9,9 +9,9 @@ from logx import EpochLogger
 # Replay Buffer
 from buffer import ReplayBuffer
 
-def sac( env_fn, seed=0, gamma=.99, lam=.97, hidden_sizes=(100,50), alpha=.5,
+def sac( env_fn, seed=0, gamma=.99, lam=.97, hidden_sizes=(200,100), alpha=.0,
     v_lr=1e-3, q_lr=1e-3, pi_lr=1e-3, polyak=1e-2, epochs=50, steps_per_epoch=1000,
-    batch_size=100, start_steps=10000, logger_kwargs=dict(), replay_size=int(1e6),
+    batch_size=100, start_steps=1000, logger_kwargs=dict(), replay_size=int(1e6),
     max_ep_len=1000, save_freq=1):
 
     logger = EpochLogger( **logger_kwargs)
@@ -26,13 +26,13 @@ def sac( env_fn, seed=0, gamma=.99, lam=.97, hidden_sizes=(100,50), alpha=.5,
 
     # Dimensions
     obs_dim = env.observation_space.shape[0]
-    act_dim = env.action_space.shape[0]
+    act_dim = env.action_space.n
 
-    act_limit = env.action_space.high[0]
+    # act_limit = env.action_space.high[0]
 
     # Placeholders
     x_ph = tf.placeholder( shape=[None,obs_dim], dtype=tf.float32)
-    a_ph = tf.placeholder( shape=[None,act_dim], dtype=tf.float32)
+    a_ph = tf.placeholder( shape=[None,1], dtype=tf.float32)
     x2_ph = tf.placeholder( shape=[None,obs_dim], dtype=tf.float32)
     r_ph = tf.placeholder( shape=[None], dtype=tf.float32)
     d_ph = tf.placeholder( shape=[None], dtype=tf.float32)
@@ -44,53 +44,58 @@ def sac( env_fn, seed=0, gamma=.99, lam=.97, hidden_sizes=(100,50), alpha=.5,
         return tf.layers.dense(x, units=hidden_sizes[-1],
             activation=output_activation)
 
-    # Why isn't the k used here ?
-    def gaussian_likelihood(x, mu, log_std):
-        EPS =1e-8
-        pre_sum = -0.5 * (((x-mu)/(tf.exp(log_std)+EPS))**2 + 2*log_std + np.log(2*np.pi))
-        return tf.reduce_sum(pre_sum, axis=1)
+    def mlp_categorical_policy(x, a, hidden_sizes, activation, output_activation, action_space):
+        act_dim = action_space.n
+        logits = mlp(x, list(hidden_sizes)+[act_dim], activation, None)
+        pi_all = tf.nn.softmax( logits)
+        logpi_all = tf.nn.log_softmax(logits)
+        # pi = tf.squeeze(tf.random.categorical(logits,1), axis=1)
+        pi = tf.random.categorical(logits,1)
+        # a = tf.cast( a, tf.uint8)
+        # logp = tf.reduce_sum(tf.one_hot(a, depth=act_dim) * logp_all, axis=1)
+        # logp_pi = tf.reduce_sum(tf.one_hot( tf.squeeze( pi, axis=1), depth=act_dim) * logp_all, axis=1)
+
+        return pi, pi_all, logpi_all
+
+    LOG_STD_MIN = -20
+    LOG_STD_MAX = 2
 
     with tf.variable_scope( "main"):
         activation = tf.tanh
         with tf.variable_scope("pi"):
-            mu = mlp( x_ph, hidden_sizes, activation, None)
-            log_std = mlp( mu, (act_dim,), activation, None)
-            mu = mlp( mu, (act_dim,), activation, None)
+            pi , pi_all, logpi_all = mlp_categorical_policy( x_ph, a_ph, hidden_sizes, activation, None, env.action_space)
 
-            pi = mu + tf.exp( log_std) * tf.random_normal( tf.shape(mu))
-
-            squashed_pi = tf.tanh( pi)
-
-            # To be sure
-            pi = tf.clip_by_value( pi, -act_limit, act_limit)
-
-            # Must take in the squased polic
-            log_squash_pi = gaussian_likelihood( squashed_pi, mu, log_std)
+        print( "### DEBUG @ main-discrete.py pi and others' dimensions")
+        print( pi)
+        print( pi_all)
+        print( logpi_all)
+        input()
 
         with tf.variable_scope( "q1"):
-            q1 = mlp( tf.concat( [x_ph, a_ph], -1), hidden_sizes+(1,),
-                activation, None)
+            q1 = tf.squeeze(mlp( tf.concat( [x_ph, a_ph], -1), hidden_sizes+(act_dim,),
+                activation, None),axis=-1)
 
         with tf.variable_scope( "q1", reuse=True):
-            q1_squash_pi = mlp( tf.concat( [x_ph, squashed_pi], -1), hidden_sizes+(1,),
-                activation, None )
+            q1_pi = tf.squeeze(mlp( tf.concat( [x_ph, tf.cast( pi, tf.float32)], axis=-1), hidden_sizes+(act_dim,),
+                activation, None ), axis=-1)
 
 
         with tf.variable_scope( "q2"):
-            q2 = mlp( tf.concat( [x_ph, a_ph], -1), hidden_sizes+(1,),
-                activation, None)
+            q2 = tf.squeeze( mlp( tf.concat( [x_ph, a_ph], -1), hidden_sizes+(act_dim,),
+                activation, None), axis=-1)
 
         with tf.variable_scope( "q2", reuse=True):
-            q2_squash_pi = mlp( tf.concat( [x_ph, squashed_pi], -1), hidden_sizes+(1,),
-            activation, None )
+            q2_pi = tf.squeeze( mlp( tf.concat( [x_ph, tf.cast( pi, tf.float32)], -1), hidden_sizes+(act_dim,),
+                activation, None ), axis=-1)
 
         with tf.variable_scope( "v"):
-            v = mlp( x_ph, hidden_sizes+(1,), activation, None)
+            # v = mlp( x_ph, hidden_sizes+(1,), activation, None)
+            v = tf.squeeze( mlp( x_ph, hidden_sizes+(1,), activation, None), axis=-1)
 
     with tf.variable_scope( "target"):
 
         with tf.variable_scope( "v"):
-            v_targ = mlp( x2_ph, hidden_sizes+(1,), activation, None)
+            v_targ = tf.squeeze( mlp( x2_ph, hidden_sizes+(1,), activation, None), axis=-1)
 
     # helpers for var count
     def get_vars(scope=''):
@@ -106,9 +111,9 @@ def sac( env_fn, seed=0, gamma=.99, lam=.97, hidden_sizes=(100,50), alpha=.5,
     print('\nNumber of parameters: \t pi: %d, \t q1: %d, \t q2: %d, \t v: %d, \t total: %d\n' % var_counts)
 
     # Targets
-    q_backup = r_ph + gamma * (1-d_ph) * v_targ
-    v_backup = tf.minimum( q1_squash_pi, q2_squash_pi) - alpha * log_squash_pi
-    q_backup, v_backuo = tf.stop_gradient( q_backup), tf.stop_gradient( v_backup)
+    q_backup_prestop = r_ph + gamma * (1-d_ph) * v_targ
+    v_backup_prestop = tf.minimum( q1_pi, q2_pi) - alpha * logp_pi
+    q_backup, v_backup = tf.stop_gradient( q_backup_prestop), tf.stop_gradient( v_backup_prestop)
 
     # Q Loss
     q1_loss = tf.reduce_mean( (q1 - q_backup) ** 2)
@@ -119,7 +124,7 @@ def sac( env_fn, seed=0, gamma=.99, lam=.97, hidden_sizes=(100,50), alpha=.5,
     v_loss = tf.reduce_mean( (v - v_backup) ** 2)
 
     # Pol loss
-    pi_loss = tf.reduce_mean( - q1_squash_pi + alpha * log_squash_pi)
+    pi_loss = tf.reduce_mean( - q1_pi + alpha * logp_pi)
 
     # Training ops
     v_trainop = tf.train.AdamOptimizer( v_lr).minimize( v_loss,
@@ -156,14 +161,14 @@ def sac( env_fn, seed=0, gamma=.99, lam=.97, hidden_sizes=(100,50), alpha=.5,
             # print( o.reshape(-1, 1))
             # input()
             while not ( d or (ep_len == max_ep_len)):
-                o, r, d, _ = test_env.step( sess.run( pi, feed_dict={ x_ph: o.reshape(1, -1)}))
+                o, r, d, _ = test_env.step( sess.run( pi, feed_dict={ x_ph: o.reshape(1, -1)})[0][0])
                 ep_ret += r
                 ep_len += 1
 
             logger.store( TestEpRet=ep_ret, TestEpLen=ep_len)
 
     #Buffer init
-    buffer = ReplayBuffer( obs_dim, act_dim, replay_size)
+    buffer = ReplayBuffer( obs_dim, 1, replay_size)
 
     # Main loop
     start_time = time.time()
@@ -172,15 +177,13 @@ def sac( env_fn, seed=0, gamma=.99, lam=.97, hidden_sizes=(100,50), alpha=.5,
 
     for t in range(total_steps):
         if t > start_steps:
-            a = sess.run( pi, feed_dict={ x_ph: o.reshape(1, -1)})
+            a = sess.run( pi, feed_dict={ x_ph: o.reshape(1, -1)})[0][0]
         else:
             a = env.action_space.sample()
 
         o2, r, d, _ = env.step( a)
         ep_ret += r
         ep_len += 1
-
-        o2, r, d, _ = env.step( o)
 
         d = False or ( ep_len == max_ep_len)
 
@@ -195,11 +198,17 @@ def sac( env_fn, seed=0, gamma=.99, lam=.97, hidden_sizes=(100,50), alpha=.5,
             for j in range( ep_len):
                 batch = buffer.sample_batch( batch_size)
                 feed_dict = {x_ph: batch['obs'],
-                                 x2_ph: batch['obs2'],
-                                 a_ph: batch['acts'],
-                                 r_ph: batch['rews'],
-                                 d_ph: batch['done']
-                                }
+                             x2_ph: batch['obs2'],
+                             a_ph: batch['acts'],
+                             r_ph: batch['rews'],
+                             d_ph: batch['done']
+                            }
+                # DEBUG:
+                # v_backup_prestop_out = sess.run( v_backup_prestop, feed_dict=feed_dict)
+                # print( v_backup_prestop_out.shape)
+                # print( v_backup_prestop_out)
+                # input()
+
                 # Value gradient steps
                 v_step_ops = [v_loss, v, v_trainop]
                 outs = sess.run( v_step_ops, feed_dict)
@@ -214,7 +223,7 @@ def sac( env_fn, seed=0, gamma=.99, lam=.97, hidden_sizes=(100,50), alpha=.5,
                 # TODO Add entropy logging
                 pi_step_ops = [ pi_loss, pi_trainop, update_v_target]
                 outs = sess.run( pi_step_ops, feed_dict=feed_dict)
-                logger.store( LossPi=outs[1])
+                logger.store( LossPi=outs[0])
 
             logger.store( EpRet=ep_ret, EpLen=ep_len)
             o, r, d, ep_ret, ep_len = env.reset(), 0, False, 0., 0
@@ -247,8 +256,8 @@ def sac( env_fn, seed=0, gamma=.99, lam=.97, hidden_sizes=(100,50), alpha=.5,
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--env', type=str, default='MountainCarContinuous-v0')
-    parser.add_argument('--hid', type=int, default=300)
+    parser.add_argument('--env', type=str, default='MountainCar-v0')
+    parser.add_argument('--hid', type=int, default=64)
     parser.add_argument('--l', type=int, default=1)
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--seed', '-s', type=int, default=0)
@@ -293,4 +302,4 @@ if __name__ == '__main__':
 
     sac(lambda : gym.make(args.env),
         gamma=args.gamma, seed=args.seed, epochs=args.epochs,
-        logger_kwargs=logger_kwargs)
+        logger_kwargs=logger_kwargs, hidden_sizes=(args.hid, args.hid))
